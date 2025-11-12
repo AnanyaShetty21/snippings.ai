@@ -1,0 +1,1 @@
+# snippings.ai
