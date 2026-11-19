@@ -40,7 +40,8 @@ Whether you copy code, notes, URLs, screenshots, or documents, Snippings.ai auto
 |------------|----------|
 | **GUI** | Tkinter, PIL (ImageTk) |
 | **Database** | SQLite3 |
-| **Clipboard Access** | pyperclip, win32clipboard, keyboard |
+| **Clipboard Access** | pyperclip, win32clipboard (Windows), xclip / wl-clipboard (Linux) |
+| **Window & Hotkey Tracking** | win32gui & keyboard (Windows), python-xlib & xprop (Linux) |
 | **AI Models** | Hugging Face Transformers, Sentence Transformers |
 | **Image Captioning** | Salesforce BLIP |
 | **Text Classification** | Facebook BART-Large-MNLI |
@@ -50,21 +51,25 @@ Whether you copy code, notes, URLs, screenshots, or documents, Snippings.ai auto
 
 ## 🧠 How It Works
 
-1. **Clipboard Monitoring**
+1. **OS Detection & Platform Adapter**
+   - Automatically detects whether the host operating system is Windows or Linux at startup.
+   - Transparently routes clipboard access, active window title tracking, and global hotkeys to the appropriate native APIs.
+
+2. **Clipboard Monitoring**
    - Continuously checks for new text or images on the clipboard.
    - Detects if copied content is new via hashing and comparison.
 
-2. **AI Processing**
+3. **AI Processing**
    - For text:
      - Classifies content type using Zero-Shot Classification.
      - Generates summaries for long text.
    - For images:
      - Extracts captions using BLIP.
 
-3. **Data Storage**
+4. **Data Storage**
    - Saves entries (text/image, summary/caption, types, timestamp, source) in SQLite.
 
-4. **GUI Interface**
+5. **GUI Interface**
    - Displays stored items in visually distinct cards.
    - Allows copy-back, delete, search, and filtering.
 
@@ -74,10 +79,51 @@ Whether you copy code, notes, URLs, screenshots, or documents, Snippings.ai auto
 
 ### Prerequisites
 - Python **3.8+**
-- Windows OS (for `win32clipboard`, `win32con`, and `win32gui`)
+- **Operating System:** Windows or Linux (auto-detected)
 - At least **8GB RAM** recommended (for loading AI models)
 
-### Clone the Repository
+#### Linux System Packages (Recommended)
+For clipboard and window management on Linux:
+- **Debian / Ubuntu:**
+  ```bash
+  sudo apt-get install xclip x11-utils python3-tk
+  ```
+  *(For Wayland sessions, `wl-clipboard` is supported as well)*
+- **Arch Linux:**
+  ```bash
+  sudo pacman -S xclip xorg-xprop tk
+  ```
+- **Fedora / RHEL:**
+  ```bash
+  sudo dnf install xclip xprop python3-tkinter
+  ```
+
+### Clone and Install
 ```bash
 git clone https://github.com/yourusername/snippings-ai.git
 cd snippings-ai
+pip install -r requirements.txt
+```
+
+### Run Snippings.ai
+```bash
+python snippings.py
+```
+
+### 📦 Model Caching
+Models are downloaded once on first launch and cached persistently on disk for both Windows and Linux:
+- **Default cache locations:**
+  - **Linux:** `~/.cache/huggingface/hub/`
+  - **Windows:** `C:\Users\<username>\.cache\huggingface\hub\`
+- **Custom cache location:**
+  You can specify a custom cache directory using the `--cache-dir` flag or the `SNIPPINGS_CACHE_DIR` environment variable:
+  ```bash
+  python snippings.py --cache-dir ./models_cache
+  ```
+  Or via environment variable:
+  ```bash
+  export SNIPPINGS_CACHE_DIR="./models_cache"  # Linux / macOS
+  set SNIPPINGS_CACHE_DIR=.\models_cache        # Windows CMD
+  $env:SNIPPINGS_CACHE_DIR=".\models_cache"     # Windows PowerShell
+  ```
+- **Offline / Local-First Loading:** On subsequent launches, Snippings.ai automatically loads cached models directly from local disk without making redundant network calls.

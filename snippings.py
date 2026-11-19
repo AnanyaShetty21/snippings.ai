@@ -2,23 +2,116 @@ import sqlite3
 import io
 import time
 import hashlib
+import platform
+import os
+import shutil
+import subprocess
 from datetime import datetime
 from threading import Thread
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageGrab, ImageTk
-import win32clipboard
-import win32con
-import keyboard
-import psutil
-import win32gui
 import pyperclip
 from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
-from sentence_transformers import SentenceTransformer, util
 import torch
+
+# Operating System Detection
+CURRENT_OS = platform.system()
+IS_WINDOWS = CURRENT_OS == "Windows"
+IS_LINUX = CURRENT_OS == "Linux"
+
+# Platform-specific imports with graceful fallbacks
+if IS_WINDOWS:
+    try:
+        import win32clipboard
+        import win32con
+        import win32gui
+    except ImportError:
+        win32clipboard = None
+        win32con = None
+        win32gui = None
+else:
+    win32clipboard = None
+    win32con = None
+    win32gui = None
+
+# Linux X11 bindings for window management and global hotkeys
+if IS_LINUX:
+    try:
+        import Xlib
+        import Xlib.display
+        import Xlib.X
+        import Xlib.XK
+    except ImportError:
+        Xlib = None
+else:
+    Xlib = None
+
+# Optional hotkey library
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
+# Optional process/system utilities
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# Optional sentence transformers
+try:
+    from sentence_transformers import SentenceTransformer, util
+except ImportError:
+    SentenceTransformer = None
+    util = None
 
 
 last_window = ""
+
+
+class X11HotkeyListener(Thread):
+    """Listens for global hotkey Ctrl+Shift+Q on Linux under X11 without requiring root."""
+    def __init__(self, callback):
+        super().__init__(daemon=True)
+        self.callback = callback
+        self.running = True
+        self.disp = None
+
+    def run(self):
+        if not Xlib:
+            return
+        try:
+            self.disp = Xlib.display.Display()
+            root = self.disp.screen().root
+            keysym = Xlib.XK.string_to_keysym('q')
+            keycode = self.disp.keysym_to_keycode(keysym)
+            # Support variations with NumLock and CapsLock
+            modifiers = [
+                Xlib.X.ControlMask | Xlib.X.ShiftMask,
+                Xlib.X.ControlMask | Xlib.X.ShiftMask | Xlib.X.Mod2Mask,
+                Xlib.X.ControlMask | Xlib.X.ShiftMask | Xlib.X.LockMask,
+                Xlib.X.ControlMask | Xlib.X.ShiftMask | Xlib.X.Mod2Mask | Xlib.X.LockMask,
+            ]
+            for mod in modifiers:
+                root.grab_key(keycode, mod, True, Xlib.X.GrabModeAsync, Xlib.X.GrabModeAsync)
+            self.disp.sync()
+
+            while self.running:
+                event = self.disp.next_event()
+                if event.type == Xlib.X.KeyPress:
+                    if self.callback:
+                        self.callback()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.running = False
+        if self.disp:
+            try:
+                self.disp.close()
+            except Exception:
+                pass
 
 class ClipboardDatabase:    
     def __init__(self, db_name="smart_clipboard.db"):
@@ -111,26 +204,90 @@ class ClipboardDatabase:
 
 
 class AIModels:    
-    def __init__(self):
-        print("Loading AI models")
+    def __init__(self, cache_dir=None):
+        # Resolve cache directory (supports explicit path, environment variable, or OS standard Hugging Face cache)
+        if cache_dir is None:
+            cache_dir = os.environ.get("SNIPPINGS_CACHE_DIR", None)
         
-        #type classifier
-        self.classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+        self.cache_dir = os.path.abspath(cache_dir) if cache_dir else None
         
-        #zero shot labels
+        resolved_cache_info = self.cache_dir
+        if not resolved_cache_info:
+            try:
+                from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+                resolved_cache_info = HUGGINGFACE_HUB_CACHE
+            except Exception:
+                resolved_cache_info = os.path.expanduser("~/.cache/huggingface/hub")
+        
+        print(f"Loading AI models (Cache directory: {resolved_cache_info})")
+        device = 0 if torch.cuda.is_available() else -1
+        
+        # 1. Type classifier (BART Large MNLI)
+        self.classifier = self._load_pipeline(
+            "zero-shot-classification",
+            model_name="facebook/bart-large-mnli",
+            device=device
+        )
+        
+        # Zero-shot classification topic labels
         self.topic_labels = [
             "code", "email", "url", "note", "idea", "news", "recipe", "shopping", "phone_number", "location",
-            "password", "credentials", "business","academic"
+            "password", "credentials", "business", "academic"
         ]
         
-        #summarizer
-        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        # 2. Summarizer (BART Large CNN)
+        self.summarizer = self._load_pipeline(
+            "summarization",
+            model_name="facebook/bart-large-cnn",
+            device=device
+        )
         
-        #image caption generator
-        self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+        # 3. Image caption generator (Salesforce BLIP)
+        self.caption_processor, self.caption_model = self._load_blip(
+            "Salesforce/blip-image-captioning-base"
+        )
+        if torch.cuda.is_available():
+            self.caption_model = self.caption_model.to("cuda")
         
-        print("AI models loaded")
+        print("AI models loaded successfully (cached)")
+
+    def _load_pipeline(self, task, model_name, device=-1):
+        model_kwargs = {}
+        if self.cache_dir:
+            model_kwargs["cache_dir"] = self.cache_dir
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        # Attempt to load strictly from local cache first (offline-friendly & fast)
+        try:
+            local_kwargs = dict(model_kwargs)
+            local_kwargs["local_files_only"] = True
+            pipe = pipeline(task, model=model_name, device=device, model_kwargs=local_kwargs)
+            print(f"  - Loaded '{model_name}' from local cache")
+            return pipe
+        except Exception:
+            print(f"  - Model '{model_name}' not in local cache; downloading and caching...")
+            pipe = pipeline(task, model=model_name, device=device, model_kwargs=model_kwargs)
+            print(f"  - Downloaded and cached '{model_name}'")
+            return pipe
+
+    def _load_blip(self, model_name):
+        kwargs = {}
+        if self.cache_dir:
+            kwargs["cache_dir"] = self.cache_dir
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        # Attempt to load strictly from local cache first
+        try:
+            processor = BlipProcessor.from_pretrained(model_name, local_files_only=True, **kwargs)
+            model = BlipForConditionalGeneration.from_pretrained(model_name, local_files_only=True, **kwargs)
+            print(f"  - Loaded '{model_name}' from local cache")
+            return processor, model
+        except Exception:
+            print(f"  - Model '{model_name}' not in local cache; downloading and caching...")
+            processor = BlipProcessor.from_pretrained(model_name, local_files_only=False, **kwargs)
+            model = BlipForConditionalGeneration.from_pretrained(model_name, local_files_only=False, **kwargs)
+            print(f"  - Downloaded and cached '{model_name}'")
+            return processor, model
     
     def classify_text(self, text):
         try:
@@ -185,13 +342,74 @@ class ClipboardMonitor:
 
     
     def get_active_window_title(self):
-        try:
-            window = win32gui.GetForegroundWindow()
-            global last_window
-            last_window = window
-            return win32gui.GetWindowText(window)
-        except:
-            return "Unknown"
+        if IS_WINDOWS and win32gui:
+            try:
+                window = win32gui.GetForegroundWindow()
+                global last_window
+                last_window = window
+                return win32gui.GetWindowText(window)
+            except Exception:
+                return "Unknown"
+        elif IS_LINUX:
+            return self._get_active_window_linux()
+        return "Unknown"
+
+    def _get_active_window_linux(self):
+        # 1. Try Xlib
+        if Xlib:
+            try:
+                disp = Xlib.display.Display()
+                root = disp.screen().root
+                net_active = disp.intern_atom('_NET_ACTIVE_WINDOW')
+                net_name = disp.intern_atom('_NET_WM_NAME')
+                wm_name = disp.intern_atom('WM_NAME')
+                prop = root.get_full_property(net_active, Xlib.X.AnyPropertyType)
+                if prop and prop.value and prop.value[0]:
+                    win = disp.create_resource_object('window', prop.value[0])
+                    name_prop = win.get_full_property(net_name, 0) or win.get_full_property(wm_name, 0)
+                    if name_prop and name_prop.value:
+                        val = name_prop.value
+                        disp.close()
+                        return val.decode('utf-8', errors='replace') if isinstance(val, bytes) else str(val)
+                disp.close()
+            except Exception:
+                pass
+
+        # 2. Try xprop
+        if shutil.which('xprop'):
+            try:
+                root_out = subprocess.check_output(
+                    ['xprop', '-root', '_NET_ACTIVE_WINDOW'],
+                    stderr=subprocess.DEVNULL, timeout=1
+                ).decode('utf-8', errors='replace')
+                win_id = root_out.strip().split()[-1]
+                if win_id not in ('0x0', '0') and win_id.startswith('0x'):
+                    out = subprocess.check_output(
+                        ['xprop', '-id', win_id, 'WM_NAME', '_NET_WM_NAME'],
+                        stderr=subprocess.DEVNULL, timeout=1
+                    ).decode('utf-8', errors='replace')
+                    for line in out.splitlines():
+                        if ' = ' in line:
+                            val = line.split(' = ', 1)[1].strip()
+                            if val.startswith('"') and val.endswith('"'):
+                                return val[1:-1]
+                            return val
+            except Exception:
+                pass
+
+        # 3. Try xdotool
+        if shutil.which('xdotool'):
+            try:
+                title = subprocess.check_output(
+                    ['xdotool', 'getactivewindow', 'getwindowname'],
+                    stderr=subprocess.DEVNULL, timeout=1
+                ).decode('utf-8', errors='replace').strip()
+                if title:
+                    return title
+            except Exception:
+                pass
+
+        return "Unknown"
     
     def get_clipboard_text(self):
         try:
@@ -201,6 +419,8 @@ class ClipboardMonitor:
             return None
     
     def safe_open_clipboard(self):
+        if not (IS_WINDOWS and win32clipboard):
+            return False
         for _ in range(10):
             try:
                 win32clipboard.OpenClipboard()
@@ -210,21 +430,75 @@ class ClipboardMonitor:
         return False
     
     def get_clipboard_image(self):
-        if not self.safe_open_clipboard():
+        if IS_WINDOWS and win32clipboard:
+            if not self.safe_open_clipboard():
+                return None
+            
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_DIB):
+                    data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
+                    bmp_header = b'BM' + (len(data) + 14).to_bytes(4, 'little') + b'\x00\x00\x00\x00\x36\x00\x00\x00'
+                    image = Image.open(io.BytesIO(bmp_header + data))
+                    return image
+            except Exception as e:
+                print(e)
+                return None
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+            
             return None
-        
+        elif IS_LINUX:
+            return self._get_clipboard_image_linux()
+        else:
+            try:
+                img = ImageGrab.grabclipboard()
+                if isinstance(img, Image.Image):
+                    return img
+            except Exception:
+                pass
+            return None
+
+    def _get_clipboard_image_linux(self):
         try:
-            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_DIB):
-                data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
-                bmp_header = b'BM' + (len(data) + 14).to_bytes(4, 'little') + b'\x00\x00\x00\x00\x36\x00\x00\x00'
-                image = Image.open(io.BytesIO(bmp_header + data))
-                return image
-        except Exception as e:
-            print(e)
+            # 1. Wayland
+            if os.getenv('WAYLAND_DISPLAY') and shutil.which('wl-paste'):
+                p = subprocess.run(['wl-paste', '--list-types'], capture_output=True, text=True, timeout=1)
+                if any('image/' in line.lower() for line in p.stdout.splitlines()):
+                    img_p = subprocess.run(['wl-paste', '-t', 'image/png'], capture_output=True, timeout=2)
+                    if img_p.returncode == 0 and img_p.stdout:
+                        img = Image.open(io.BytesIO(img_p.stdout))
+                        img.load()
+                        return img
+
+            # 2. X11 via xclip
+            if shutil.which('xclip'):
+                p = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'], capture_output=True, text=True, timeout=1)
+                targets = p.stdout.splitlines()
+                image_target = None
+                for t in targets:
+                    t_clean = t.strip().lower()
+                    if t_clean in ('image/png', 'image/jpeg', 'image/bmp', 'image/tiff') or 'image/' in t_clean:
+                        image_target = t.strip()
+                        break
+                if image_target:
+                    img_p = subprocess.run(['xclip', '-selection', 'clipboard', '-t', image_target, '-o'], capture_output=True, timeout=2)
+                    if img_p.returncode == 0 and img_p.stdout:
+                        img = Image.open(io.BytesIO(img_p.stdout))
+                        img.load()
+                        return img
+                else:
+                    return None
+
+            # 3. Pillow ImageGrab fallback
+            img = ImageGrab.grabclipboard()
+            if isinstance(img, Image.Image):
+                img.load()
+                return img
+        except Exception:
             return None
-        finally:
-            win32clipboard.CloseClipboard()
-        
         return None
     
     def compute_image_hash(self, image):
@@ -334,9 +608,37 @@ class ClipboardGUI:
         self.setup_gui()
         self.filter_mode = "all"
         self.current_type_filter = None
+        self.x11_hotkey_listener = None
         
-        keyboard.add_hotkey('ctrl+shift+q', self.toggle_window)
+        self.setup_hotkeys()
+    
+    def setup_hotkeys(self):
+        # In-app local hotkeys
         self.root.bind('<Escape>', lambda e: self.hide_window())
+        self.root.bind('<Control-Shift-Q>', lambda e: self.toggle_window())
+        self.root.bind('<Control-Shift-q>', lambda e: self.toggle_window())
+
+        hotkey_registered = False
+
+        # Try `keyboard` library (Windows default, or Linux when run with appropriate permissions)
+        if keyboard:
+            try:
+                keyboard.add_hotkey('ctrl+shift+q', lambda: self.root.after(0, self.toggle_window))
+                hotkey_registered = True
+            except Exception:
+                pass
+
+        # For Linux X11, use X11 global key grab without requiring root
+        if not hotkey_registered and IS_LINUX and Xlib:
+            try:
+                self.x11_hotkey_listener = X11HotkeyListener(lambda: self.root.after(0, self.toggle_window))
+                self.x11_hotkey_listener.start()
+                hotkey_registered = True
+            except Exception as e:
+                print(f"X11 global hotkey setup failed: {e}")
+
+        if not hotkey_registered:
+            print("Note: Global hotkey (Ctrl+Shift+Q) could not be registered in background. In-app hotkeys and window controls remain active.")
     
     def setup_gui(self):
         title_frame = tk.Frame(self.root, bg=self.secondary_bg, height=60)
@@ -532,23 +834,47 @@ class ClipboardGUI:
     def copy_to_clipboard(self, text, image_blob):
         try:
             if image_blob:
-                image = Image.open(io.BytesIO(image_blob))
-                output = io.BytesIO()
-                image.convert('RGB').save(output, 'BMP')
-                data = output.getvalue()[14:]
-                output.close()
-                
-                win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_DIB, data)
-                win32clipboard.CloseClipboard()
-                
-                self.status_label.config(text="Image copied to clipboard!")
+                if IS_WINDOWS and win32clipboard and win32con:
+                    image = Image.open(io.BytesIO(image_blob))
+                    output = io.BytesIO()
+                    image.convert('RGB').save(output, 'BMP')
+                    data = output.getvalue()[14:]
+                    output.close()
+                    
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32con.CF_DIB, data)
+                    win32clipboard.CloseClipboard()
+                    self.status_label.config(text="Image copied to clipboard!")
+                elif IS_LINUX:
+                    if self._copy_image_to_clipboard_linux(image_blob):
+                        self.status_label.config(text="Image copied to clipboard!")
+                    else:
+                        self.status_label.config(text="Failed to copy image: please install xclip or wl-clipboard")
+                else:
+                    self.status_label.config(text="Image copying not supported on this OS")
             elif text:
                 pyperclip.copy(text)
                 self.status_label.config(text="Text copied to clipboard!")
         except Exception as e:
-            messagebox.showerror("Error", e)
+            messagebox.showerror("Error", str(e))
+
+    def _copy_image_to_clipboard_linux(self, image_blob):
+        if os.getenv('WAYLAND_DISPLAY') and shutil.which('wl-copy'):
+            try:
+                p = subprocess.Popen(['wl-copy', '-t', 'image/png'], stdin=subprocess.PIPE)
+                p.communicate(input=image_blob)
+                return p.returncode == 0
+            except Exception:
+                pass
+        if shutil.which('xclip'):
+            try:
+                p = subprocess.Popen(['xclip', '-selection', 'clipboard', '-t', 'image/png'], stdin=subprocess.PIPE)
+                p.communicate(input=image_blob)
+                return p.returncode == 0
+            except Exception:
+                pass
+        return False
     
     def delete_item(self, item_id):
         self.database.delete_item(item_id)
@@ -646,16 +972,32 @@ class ClipboardGUI:
     def hide_window(self):
         self.root.withdraw()
     
+    def destroy(self):
+        if self.x11_hotkey_listener:
+            self.x11_hotkey_listener.stop()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.destroy()
 
 
 def main():
-    print("Starting snippings.ai")
+    import argparse
+    parser = argparse.ArgumentParser(description="Snippings.ai - Cross-Platform AI Clipboard Manager")
+    parser.add_argument("--cache-dir", default=None, help="Directory to cache downloaded AI models")
+    args, _ = parser.parse_known_args()
+
+    print(f"Starting snippings.ai (Detected OS: {CURRENT_OS})")
     print("\nInitializing database")
     database = ClipboardDatabase()
     print("\nLoading AI models")
-    ai_models = AIModels()
+    ai_models = AIModels(cache_dir=args.cache_dir)
     print("\nSetting up GUI")
     gui = None
     
@@ -674,6 +1016,8 @@ def main():
         gui.run()
     except KeyboardInterrupt:
         print("\n\nShutting down")
+        if gui:
+            gui.destroy()
         monitor.stop_monitoring()
 
 
