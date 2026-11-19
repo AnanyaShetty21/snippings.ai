@@ -15,6 +15,11 @@ import pyperclip
 from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
 import torch
 
+from embedding_service import EmbeddingService
+from retrieval_service import RetrievalService
+from query_service import QueryService
+import credential_service
+
 # Operating System Detection
 CURRENT_OS = platform.system()
 IS_WINDOWS = CURRENT_OS == "Windows"
@@ -116,6 +121,8 @@ class X11HotkeyListener(Thread):
 class ClipboardDatabase:    
     def __init__(self, db_name="smart_clipboard.db"):
         self.db_name = db_name
+        self.embedding_service = EmbeddingService()
+        self.retrieval_service = RetrievalService(db_name, self.embedding_service)
         self.init_database()
     
     def init_database(self):
@@ -130,6 +137,12 @@ class ClipboardDatabase:
         
         conn.commit()
         conn.close()
+
+        # Initialize FTS5 and embeddings database tables
+        self.retrieval_service.init_database()
+
+        # Asynchronously sync any unindexed historical entries in the background
+        Thread(target=self.embedding_service.sync_all, args=(self.db_name,), daemon=True).start()
     
     def insert_item(self, text=None, summary=None, image=None, caption=None, type1=None, type2=None, type3=None, source="Unknown", timestamp=None):
         if timestamp is None:
@@ -147,6 +160,15 @@ class ClipboardDatabase:
         conn.commit()
         item_id = cursor.lastrowid
         conn.close()
+
+        # Incremental indexing for Ask My Clipboard
+        try:
+            conn_idx = sqlite3.connect(self.db_name)
+            self.embedding_service.index_item(conn_idx, item_id, text, summary, caption)
+            conn_idx.close()
+        except Exception as e:
+            print(f"Incremental indexing error: {e}")
+
         return item_id
     
     def get_all_items(self):
@@ -198,6 +220,7 @@ class ClipboardDatabase:
         cursor = conn.cursor()
         
         cursor.execute("DELETE FROM clipboard_items WHERE id = ?", (item_id,))
+        cursor.execute("DELETE FROM snippet_embeddings WHERE item_id = ?", (item_id,))
         
         conn.commit()
         conn.close()
@@ -587,10 +610,12 @@ class ClipboardGUI:
         self.database = database
         self.ai_models = ai_models
         self.monitor = monitor
+        self.query_service = QueryService(self.database.db_name, self.database.embedding_service)
+        self.is_asking = False
         
         self.root = tk.Tk()
         self.root.title("Snippings.ai")
-        self.root.geometry("900x600")
+        self.root.geometry("980x660")
         self.root.withdraw() 
         
         self.bg_color = "#2b2d31" 
@@ -605,6 +630,7 @@ class ClipboardGUI:
         
         self.root.configure(bg=self.bg_color)
         
+        self.use_ollama_var = tk.BooleanVar(value=self.query_service.llm_service.is_available())
         self.setup_gui()
         self.filter_mode = "all"
         self.current_type_filter = None
@@ -672,26 +698,85 @@ class ClipboardGUI:
                              bg=self.bg_color, fg=self.secondary_fg)
         view_label.pack(side=tk.LEFT, padx=(30, 10))
         
-        all_button = tk.Button(control_frame, text="All Items", 
+        self.all_button = tk.Button(control_frame, text="All Items", 
                               command=self.show_all_items,
                               font=("Segoe UI", 9),
                               bg=self.accent_color, fg=self.fg_color,
                               activebackground=self.accent_hover,
                               activeforeground=self.fg_color,
                               relief=tk.FLAT, bd=0, cursor="hand2")
-        all_button.pack(side=tk.LEFT, padx=3, ipady=6, ipadx=12)
+        self.all_button.pack(side=tk.LEFT, padx=3, ipady=6, ipadx=12)
         
-        type_button = tk.Button(control_frame, text="By Type", 
+        self.type_button = tk.Button(control_frame, text="By Type", 
                                command=self.show_type_filter,
                                font=("Segoe UI", 9),
                                bg=self.card_bg, fg=self.fg_color,
                                activebackground=self.accent_color,
                                activeforeground=self.fg_color,
                                relief=tk.FLAT, bd=0, cursor="hand2")
-        type_button.pack(side=tk.LEFT, padx=3, ipady=6, ipadx=12)
+        self.type_button.pack(side=tk.LEFT, padx=3, ipady=6, ipadx=12)
+
+        self.ask_button = tk.Button(control_frame, text="", 
+                               command=self.toggle_ask_view,
+                               font=("Segoe UI", 9, "bold"),
+                               bg=self.card_bg, fg=self.fg_color,
+                               activebackground=self.accent_hover,
+                               activeforeground=self.fg_color,
+                               relief=tk.FLAT, bd=0, cursor="hand2")
+        self.ask_button.pack(side=tk.LEFT, padx=3, ipady=6, ipadx=12)
         
+        # Dedicated Ask My Clipboard Panel
+        self.ask_panel = tk.Frame(self.root, bg=self.secondary_bg, padx=20, pady=12)
+        
+        ask_title = tk.Label(self.ask_panel, text="Ask the clipboard", 
+                             font=("Segoe UI", 11, "bold"), bg=self.secondary_bg, fg=self.fg_color)
+        ask_title.pack(anchor=tk.W, pady=(0, 2))
+        
+        ask_desc = tk.Label(self.ask_panel, text="Ask in plain English (e.g. 'Find the Python code for binary search', 'What documentation URL did I copy?', 'Where is my API key?')", 
+                            font=("Segoe UI", 9), bg=self.secondary_bg, fg=self.secondary_fg)
+        ask_desc.pack(anchor=tk.W, pady=(0, 8))
+        
+        query_row = tk.Frame(self.ask_panel, bg=self.secondary_bg)
+        query_row.pack(fill=tk.X, pady=(0, 6))
+        
+        self.nl_query_var = tk.StringVar()
+        self.nl_query_entry = tk.Entry(query_row, textvariable=self.nl_query_var,
+                                       font=("Segoe UI", 10),
+                                       bg=self.card_bg, fg=self.fg_color,
+                                       insertbackground=self.fg_color,
+                                       relief=tk.FLAT, bd=0)
+        self.nl_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7, ipadx=10, padx=(0, 10))
+        self.nl_query_entry.bind('<Return>', lambda e: self.perform_ask_search())
+        
+        self.ask_submit_btn = tk.Button(query_row, text="Ask", 
+                                        command=self.perform_ask_search,
+                                        font=("Segoe UI", 9, "bold"),
+                                        bg=self.accent_color, fg=self.fg_color,
+                                        activebackground=self.accent_hover,
+                                        activeforeground=self.fg_color,
+                                        relief=tk.FLAT, bd=0, cursor="hand2")
+        self.ask_submit_btn.pack(side=tk.LEFT, padx=(0, 15), ipady=5, ipadx=16)
+        
+        ollama_available = self.query_service.llm_service.is_available()
+        self.ollama_cb = tk.Checkbutton(query_row, text="AI Summary (Ollama qwen3:4b)", 
+                                        variable=self.use_ollama_var,
+                                        font=("Segoe UI", 9),
+                                        bg=self.secondary_bg, fg=self.fg_color,
+                                        selectcolor=self.card_bg,
+                                        activebackground=self.secondary_bg,
+                                        activeforeground=self.fg_color)
+        self.ollama_cb.pack(side=tk.LEFT)
+        if not ollama_available:
+            self.use_ollama_var.set(False)
+            self.ollama_cb.config(state=tk.DISABLED, text="Ollama (Offline)")
+        
+        self.ask_status_label = tk.Label(self.ask_panel, text="Hybrid retrieval active: multi-qa-MiniLM semantic embeddings + SQLite FTS5 keyword matching", 
+                                         font=("Segoe UI", 8, "italic"),
+                                         bg=self.secondary_bg, fg=self.secondary_fg)
+        self.ask_status_label.pack(anchor=tk.W)
         
         content_frame = tk.Frame(self.root, bg=self.bg_color)
+        self.content_frame = content_frame
         content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
         
         scrollbar = tk.Scrollbar(content_frame, bg=self.card_bg,
@@ -740,7 +825,25 @@ class ClipboardGUI:
         self.status_label.config(text=f"Showing {len(items)} items")
     
     def create_item_widget(self, item):
-        item_id, text, summary, image_blob, caption, type1, type2, type3, source, timestamp = item
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            text = item.get("text")
+            summary = item.get("summary")
+            image_blob = item.get("image")
+            caption = item.get("caption")
+            type1 = item.get("type1")
+            type2 = item.get("type2")
+            type3 = item.get("type3")
+            source = item.get("source", "Unknown")
+            timestamp = item.get("timestamp")
+            match_confidence = item.get("match_confidence")
+            is_sensitive = item.get("is_sensitive", False)
+            masked_text = item.get("masked_text", text)
+        else:
+            item_id, text, summary, image_blob, caption, type1, type2, type3, source, timestamp = item[:10]
+            match_confidence = None
+            is_sensitive = credential_service.is_sensitive(text, [type1, type2, type3]) if text else False
+            masked_text = credential_service.mask_snippet(text) if is_sensitive else text
         
         item_frame = tk.Frame(self.items_frame, bg=self.card_bg, 
                              relief=tk.FLAT, bd=0)
@@ -755,9 +858,57 @@ class ClipboardGUI:
                              bg=self.card_bg, fg=self.secondary_fg,
                              anchor=tk.W)
         info_label.pack(side=tk.LEFT)
+
+        if match_confidence is not None:
+            match_badge = tk.Label(header_frame, text=f"🎯 {match_confidence}% Match",
+                                  font=("Segoe UI", 8, "bold"),
+                                  bg="#2d7d46", fg=self.fg_color,
+                                  padx=6, pady=2)
+            match_badge.pack(side=tk.LEFT, padx=(10, 0))
+
+        if is_sensitive:
+            sec_badge = tk.Label(header_frame, text="🔒 Sensitive Credential",
+                                font=("Segoe UI", 8, "bold"),
+                                bg="#b23b3b", fg=self.fg_color,
+                                padx=6, pady=2)
+            sec_badge.pack(side=tk.LEFT, padx=(8, 0))
         
         button_frame = tk.Frame(header_frame, bg=self.card_bg)
         button_frame.pack(side=tk.RIGHT)
+
+        # Show / Hide toggle button for sensitive credentials
+        is_revealed = [False]
+        content_label_ref = [None]
+
+        if is_sensitive and text:
+            def toggle_reveal():
+                is_revealed[0] = not is_revealed[0]
+                if content_label_ref[0]:
+                    if is_revealed[0]:
+                        content_label_ref[0].config(text=text[:300] + ("..." if len(text) > 300 else ""))
+                        reveal_btn.config(text="Hide")
+                    else:
+                        content_label_ref[0].config(text=masked_text)
+                        reveal_btn.config(text="Show")
+
+            reveal_btn = tk.Button(button_frame, text="Show",
+                                   command=toggle_reveal,
+                                   font=("Segoe UI", 9),
+                                   bg="#4f545c", fg=self.fg_color,
+                                   activebackground=self.accent_hover,
+                                   activeforeground=self.fg_color,
+                                   relief=tk.FLAT, bd=0, cursor="hand2")
+            reveal_btn.pack(side=tk.LEFT, padx=3, ipady=4, ipadx=8)
+
+        if text and len(text) > 300:
+            view_full_btn = tk.Button(button_frame, text="View Full",
+                                      command=lambda: self.show_full_snippet_dialog(text),
+                                      font=("Segoe UI", 9),
+                                      bg="#4f545c", fg=self.fg_color,
+                                      activebackground=self.accent_hover,
+                                      activeforeground=self.fg_color,
+                                      relief=tk.FLAT, bd=0, cursor="hand2")
+            view_full_btn.pack(side=tk.LEFT, padx=3, ipady=4, ipadx=8)
         
         copy_btn = tk.Button(button_frame, text="Copy", 
                             command=lambda: self.copy_to_clipboard(text, image_blob),
@@ -813,9 +964,11 @@ class ClipboardGUI:
                 print(e)
         
         if text:
-            display_text = summary if summary else text
-            if len(display_text) > 300:
-                display_text = display_text[:300] + "..."
+            initial_text = masked_text if is_sensitive else (summary if summary else text)
+            if len(initial_text) > 300:
+                display_text = initial_text[:300] + "..."
+            else:
+                display_text = initial_text
             
             text_label = tk.Label(content_frame, text=display_text,
                                  font=("Segoe UI", 10),
@@ -823,13 +976,45 @@ class ClipboardGUI:
                                  wraplength=800, justify=tk.LEFT,
                                  anchor=tk.W)
             text_label.pack(fill=tk.X, pady=5)
+            content_label_ref[0] = text_label
             
-            if summary:
+            if summary and not is_sensitive:
                 full_text_label = tk.Label(content_frame, 
                                           text="(Summarized - click Copy to get full text)",
                                           font=("Segoe UI", 8, "italic"),
                                           bg=self.card_bg, fg=self.secondary_fg)
                 full_text_label.pack(anchor=tk.W)
+
+    def show_full_snippet_dialog(self, text, title="Clipboard Snippet"):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("640x420")
+        dialog.configure(bg=self.bg_color)
+        
+        header = tk.Frame(dialog, bg=self.secondary_bg, height=45)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="Full Snippet Content", font=("Segoe UI", 11, "bold"),
+                 bg=self.secondary_bg, fg=self.fg_color).pack(side=tk.LEFT, padx=15, pady=10)
+        
+        copy_btn = tk.Button(header, text="Copy", command=lambda: pyperclip.copy(text),
+                             font=("Segoe UI", 9), bg=self.success_color, fg=self.fg_color,
+                             relief=tk.FLAT, bd=0, cursor="hand2")
+        copy_btn.pack(side=tk.RIGHT, padx=15, pady=8, ipady=3, ipadx=10)
+        
+        text_frame = tk.Frame(dialog, bg=self.bg_color)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        scroll = tk.Scrollbar(text_frame)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text_box = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 10),
+                           bg=self.card_bg, fg=self.fg_color,
+                           yscrollcommand=scroll.set, relief=tk.FLAT, bd=0)
+        text_box.insert(tk.END, text)
+        text_box.config(state=tk.DISABLED)
+        text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.config(command=text_box.yview)
     
     def copy_to_clipboard(self, text, image_blob):
         try:
@@ -883,10 +1068,18 @@ class ClipboardGUI:
     
     def show_all_items(self):
         self.filter_mode = "all"
+        self.ask_panel.pack_forget()
+        self.all_button.config(bg=self.accent_color)
+        self.type_button.config(bg=self.card_bg)
+        self.ask_button.config(bg=self.card_bg)
         items = self.database.get_all_items()
         self.display_items(items)
     
     def show_type_filter(self):
+        self.ask_panel.pack_forget()
+        self.all_button.config(bg=self.card_bg)
+        self.type_button.config(bg=self.accent_color)
+        self.ask_button.config(bg=self.card_bg)
         items = self.database.get_all_items()
         types = set()
         for item in items:
@@ -937,6 +1130,82 @@ class ClipboardGUI:
                  activebackground=self.accent_hover,
                  activeforeground=self.fg_color,
                  relief=tk.FLAT, bd=0, cursor="hand2").pack(pady=15, ipady=8, ipadx=20)
+
+    def toggle_ask_view(self):
+        self.filter_mode = "ask"
+        self.all_button.config(bg=self.card_bg)
+        self.type_button.config(bg=self.card_bg)
+        self.ask_button.config(bg=self.accent_color)
+        self.ask_panel.pack(fill=tk.X, padx=20, pady=(0, 10), before=self.content_frame)
+        self.nl_query_entry.focus()
+        self.status_label.config(text="Ask My Clipboard active: enter natural language queries")
+
+    def perform_ask_search(self):
+        query = self.nl_query_var.get().strip()
+        if not query:
+            self.ask_status_label.config(text="Please enter a question or query above.")
+            return
+
+        self.ask_submit_btn.config(state=tk.DISABLED)
+        self.ask_status_label.config(text="⏳ Searching clipboard with hybrid semantic embeddings + keyword matching...")
+
+        def _search_worker():
+            try:
+                res = self.query_service.ask(query, use_llm=self.use_ollama_var.get())
+                self.root.after(0, lambda: self._on_ask_results(res))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_ask_error(str(e)))
+
+        Thread(target=_search_worker, daemon=True).start()
+
+    def _on_ask_results(self, res):
+        self.ask_submit_btn.config(state=tk.NORMAL)
+        results = res.get("results", [])
+        elapsed = res.get("execution_time_ms", 0)
+        self.ask_status_label.config(text=f"Retrieved {len(results)} matches in {elapsed}ms")
+        self.display_ask_results(res)
+
+    def _on_ask_error(self, err_msg):
+        self.ask_submit_btn.config(state=tk.NORMAL)
+        self.ask_status_label.config(text=f"Search error: {err_msg}")
+        messagebox.showerror("Search Error", f"Error during retrieval: {err_msg}")
+
+    def display_ask_results(self, res):
+        self.clear_items_display()
+        results = res.get("results", [])
+        answer = res.get("answer", "")
+        llm_used = res.get("llm_used", False)
+
+        # 1. AI Grounded Answer Card (if available)
+        if answer and (llm_used or results):
+            ai_card = tk.Frame(self.items_frame, bg="#202225", relief=tk.FLAT, bd=0, padx=15, pady=12)
+            ai_card.pack(fill=tk.X, padx=0, pady=(0, 12))
+            
+            ai_title = tk.Label(ai_card, text="💡 Ask My Clipboard Insight" if llm_used else "🔍 Search Results Summary",
+                                font=("Segoe UI", 10, "bold"),
+                                bg="#202225", fg="#5865f2" if llm_used else self.secondary_fg)
+            ai_title.pack(anchor=tk.W)
+            
+            ai_text = tk.Label(ai_card, text=answer,
+                               font=("Segoe UI", 10),
+                               bg="#202225", fg=self.fg_color,
+                               wraplength=850, justify=tk.LEFT)
+            ai_text.pack(fill=tk.X, anchor=tk.W, pady=(5, 0))
+
+        # 2. Results list
+        if not results:
+            no_items_label = tk.Label(self.items_frame, 
+                                     text="No matching clipboard items found.\nTry broader natural language terms or check 'All Items'.",
+                                     font=("Segoe UI", 11),
+                                     bg=self.bg_color, fg=self.secondary_fg)
+            no_items_label.pack(pady=40)
+            self.status_label.config(text="No matches found")
+            return
+
+        for item in results:
+            self.create_item_widget(item)
+
+        self.status_label.config(text=f"Showing top {len(results)} relevant matches")
     
  
     
